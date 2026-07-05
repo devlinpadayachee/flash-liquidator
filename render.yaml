@@ -1,0 +1,55 @@
+# Render blueprint for the Illyrian liquidation engine + dashboard.
+# One web service runs both the bot and the live dashboard. Render injects
+# PORT (the dashboard binds it) and probes /health.
+#
+# Deploy: push this repo to GitHub, then in Render → New → Blueprint, point at
+# the repo. Set the `sync: false` secrets in the Render dashboard (never commit
+# them). Flip DRY_RUN to "false" when you're ready to trade for real.
+
+services:
+  - type: web
+    name: illyrian-liquidator
+    runtime: node
+    # Free tier sleeps after ~15 min without HTTP traffic, which stops the bot.
+    # Use "starter" ($7/mo) so it runs 24/7. Change to "free" to try it first.
+    plan: starter
+    region: frankfurt
+    buildCommand: npm install
+    startCommand: node src/index.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 20.11.1
+      - key: CHAIN
+        value: POLYGON
+      # SAFETY: defaults to simulation. Set to "false" in Render to go live.
+      - key: DRY_RUN
+        value: "true"
+      - key: MIN_PROFIT_USD
+        value: "0.3"
+      - key: MAX_GAS_USD
+        value: "5"
+      - key: USE_MEV_PROTECTION
+        value: "false"
+      - key: USE_MEMPOOL
+        value: "true"
+      # --- Secrets: set these in the Render dashboard, do not commit ---
+      - key: PRIVATE_KEY
+        sync: false
+      - key: POLYGON_RPC_URL
+        sync: false
+      - key: POLYGON_WSS_URL
+        sync: false
+      - key: POLYGON_CONTRACT_ADDRESS
+        sync: false
+      - key: GRAPH_API_KEY
+        sync: false
+      # Optional: lock the dashboard behind a token (recommended - the URL is public)
+      - key: DASHBOARD_TOKEN
+        sync: false
+      # Optional Telegram alerts
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false

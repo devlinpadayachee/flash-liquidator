@@ -439,23 +439,18 @@ class HealthMonitor {
     try {
       this.wsProvider = new ethers.WebSocketProvider(wssUrl);
 
-      // Handle WebSocket errors gracefully
-      this.wsProvider.websocket?.on?.('error', (err) => {
-        console.log(`   ⚠️ WebSocket error: ${err.message} - continuing in polling mode`);
-        this.wsProvider = null;
-      });
-
-      // Handle WebSocket close
-      this.wsProvider.websocket?.on?.('close', () => {
-        console.log(`   ⚠️ WebSocket closed - continuing in polling mode`);
-        this.wsProvider = null;
-      });
+      // Attach socket guards immediately so a connect-time ETIMEDOUT is caught
+      // here rather than surfacing as an uncaught exception.
+      this._attachSocketGuards();
 
       // Wait for connection with timeout
       const timeout = new Promise((_, reject) =>
         setTimeout(() => reject(new Error('WebSocket connection timeout')), 10000)
       );
       await Promise.race([this.wsProvider.ready, timeout]);
+
+      // Re-attach after ready - ethers may swap the underlying socket
+      this._attachSocketGuards();
       console.log(`   ✅ WebSocket connected for real-time events`);
 
       // Listen for price oracle updates (triggers health recalculation)
@@ -476,8 +471,30 @@ class HealthMonitor {
     } catch (err) {
       console.log(`   ⚠️ WebSocket failed: ${err.message}`);
       console.log(`      Falling back to polling mode`);
+      try { this.wsProvider?.destroy?.(); } catch (_) {}
       this.wsProvider = null;
     }
+  }
+
+  /**
+   * Attach error/close handlers to the underlying WebSocket so a dropped or
+   * timed-out real-time connection is handled here instead of crashing the
+   * process. Real-time events are an optimization; polling is the fallback.
+   * Idempotent - safe to call multiple times.
+   */
+  _attachSocketGuards() {
+    const sock = this.wsProvider?.websocket;
+    if (!sock || sock.__guarded || typeof sock.on !== 'function') return;
+    sock.__guarded = true;
+    sock.on('error', (err) => {
+      console.log(`   ⚠️ WebSocket error: ${err?.message || err} - continuing in polling mode`);
+      try { this.wsProvider?.destroy?.(); } catch (_) {}
+      this.wsProvider = null;
+    });
+    sock.on('close', () => {
+      console.log(`   ⚠️ WebSocket closed - continuing in polling mode`);
+      this.wsProvider = null;
+    });
   }
 
   /**

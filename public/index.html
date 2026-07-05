@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark" />
+  <title>ILLYRIAN · liquidation vitals</title>
+  <meta name="description" content="Live vitals monitor for a flash-loan liquidation engine." />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/style.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='6' fill='%2335C8B6'/%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%2335C8B6' stroke-width='1.5' opacity='.5'/%3E%3C/svg%3E" />
+</head>
+<body data-status="boot">
+  <!-- Boot sweep overlay -->
+  <div class="boot" id="boot" aria-hidden="true">
+    <div class="boot__ring"></div>
+    <div class="boot__label">ILLYRIAN</div>
+    <div class="boot__sub" id="bootSub">powering instruments…</div>
+  </div>
+
+  <!-- ============ TOP RAIL ============ -->
+  <header class="rail">
+    <div class="rail__brand">
+      <span class="mark" aria-hidden="true"></span>
+      <span class="rail__name">ILLYRIAN</span>
+      <span class="rail__tag">liquidation vitals</span>
+    </div>
+
+    <div class="rail__chips">
+      <span class="chip" id="chipChain"><i>chain</i><b data-f="chain">—</b></span>
+      <span class="chip" id="chipWallet"><i>operator</i><b data-f="wallet">—</b></span>
+      <span class="chip" id="chipBalance"><i>gas tank</i><b data-f="balance">—</b></span>
+      <span class="chip chip--contract" id="chipContract"><i>engine</i><b data-f="contract">—</b></span>
+    </div>
+
+    <div class="rail__live">
+      <canvas class="ecg" id="ecg" width="150" height="34" aria-hidden="true"></canvas>
+      <span class="pill" id="statePill"><span class="dot"></span><b id="stateText">CONNECTING</b></span>
+      <span class="clock" id="clock">--:--:--</span>
+    </div>
+  </header>
+
+  <!-- ============ GRID ============ -->
+  <main class="grid" id="grid">
+
+    <!-- HERO — THE LINE -->
+    <section class="panel hero" aria-label="Liquidation line">
+      <div class="panel__head">
+        <h2>THE LINE</h2>
+        <p class="panel__sub">positions plotted by distance to liquidation · HF&nbsp;1.0</p>
+        <div class="legend">
+          <span><i class="swatch swatch--safe"></i>safe</span>
+          <span><i class="swatch swatch--warn"></i>closing</span>
+          <span><i class="swatch swatch--flare"></i>imminent</span>
+        </div>
+      </div>
+      <div class="hero__stage">
+        <canvas id="line" aria-hidden="true"></canvas>
+        <div class="hero__empty" id="lineEmpty" hidden>market's healthy — nothing near the line. Standing by.</div>
+        <div class="tooltip" id="tip" hidden></div>
+      </div>
+      <div class="hero__foot">
+        <span class="hero__count"><b id="watchCount">0</b> watched</span>
+        <span class="hero__strike"><b id="strikeCount">0</b> in the strike zone</span>
+      </div>
+    </section>
+
+    <!-- VITALS READOUTS -->
+    <aside class="panel vitals" aria-label="Vitals">
+      <div class="panel__head"><h2>VITALS</h2><p class="panel__sub" id="modeStr">—</p></div>
+      <div class="readout readout--hero">
+        <span class="readout__label">net take</span>
+        <span class="readout__value phos" id="netTake">$0.00</span>
+        <span class="readout__foot"><b id="grossTake">$0.00</b> gross · <b id="gasSpent" class="neg">$0.00</b> gas</span>
+      </div>
+      <div class="readout-grid">
+        <div class="readout"><span class="readout__label">executed</span><span class="readout__value" id="execRate">0<em>/0</em></span></div>
+        <div class="readout"><span class="readout__label">win rate</span><span class="readout__value" id="winRate">—</span></div>
+        <div class="readout"><span class="readout__label">watched</span><span class="readout__value" id="tracked">0</span></div>
+        <div class="readout"><span class="readout__label">at&nbsp;risk</span><span class="readout__value amber" id="atRisk">0</span></div>
+      </div>
+      <div class="minprofit" id="minProfitRow">
+        <span>floor</span><b id="minProfit">—</b>
+        <span>max gas</span><b id="maxGas">—</b>
+        <span>slippage</span><b id="slippage">—</b>
+      </div>
+    </aside>
+
+    <!-- WATCHLIST -->
+    <section class="panel watch" aria-label="Watchlist">
+      <div class="panel__head"><h2>WATCHLIST</h2><p class="panel__sub">closest to the line first</p></div>
+      <div class="table" id="watchTable" role="table">
+        <div class="tr th" role="row">
+          <span role="columnheader">borrower</span>
+          <span role="columnheader" class="num">HF</span>
+          <span role="columnheader" class="num">debt</span>
+          <span role="columnheader">proximity</span>
+        </div>
+        <div class="tbody" id="watchBody"></div>
+      </div>
+    </section>
+
+    <!-- TIMELINE + CONNECTIONS -->
+    <section class="panel scope" aria-label="Profit and connections">
+      <div class="panel__head"><h2>TAKE · TIMELINE</h2><p class="panel__sub" id="timelineSub">cumulative net</p></div>
+      <canvas id="spark" class="spark" aria-hidden="true"></canvas>
+      <div class="conns" id="conns">
+        <span class="conn" data-k="wss"><i></i>wss</span>
+        <span class="conn" data-k="mempool"><i></i>mempool</span>
+        <span class="conn" data-k="subgraph"><i></i>subgraph</span>
+        <span class="conn conn--rpc"><b id="rpcMin">0</b><em>rpc/min</em></span>
+      </div>
+    </section>
+
+    <!-- EVENTS -->
+    <section class="panel events" aria-label="Executions">
+      <div class="panel__head"><h2>EXECUTIONS</h2><p class="panel__sub">every liquidation attempt</p></div>
+      <div class="feed" id="eventFeed">
+        <div class="feed__empty" id="eventEmpty">No attempts yet. On the hunt.</div>
+      </div>
+    </section>
+
+    <!-- CONSOLE -->
+    <section class="panel console" aria-label="System log">
+      <div class="panel__head"><h2>SYSTEM</h2><p class="panel__sub">live console</p>
+        <button class="ghostbtn" id="pauseLog" type="button" aria-pressed="false">pause</button>
+      </div>
+      <div class="log" id="log" role="log" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <!-- Token gate -->
+  <div class="gate" id="gate" hidden>
+    <form class="gate__box" id="gateForm">
+      <span class="mark" aria-hidden="true"></span>
+      <h3>Access key required</h3>
+      <p>This monitor is locked. Enter the dashboard token to watch the engine.</p>
+      <input type="password" id="gateInput" placeholder="dashboard token" autocomplete="off" spellcheck="false" />
+      <button type="submit">Unlock</button>
+      <span class="gate__err" id="gateErr" hidden>That key didn't work.</span>
+    </form>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

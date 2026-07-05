@@ -30,6 +30,9 @@ const GasBidder = require('./utils/gasBidder');
 const TelegramNotifier = require('./utils/telegram');
 const Multicall = require('./utils/multicall');
 const UI = require('./utils/ui');
+const botState = require('./server/botState');
+const { startDashboard } = require('./server/dashboard');
+const { installLogCapture } = require('./server/logCapture');
 
 class FlashLiquidatorBot {
   constructor() {
@@ -197,6 +200,29 @@ class FlashLiquidatorBot {
       dryRun: this.settings.dryRun,
     });
 
+    // Publish initial state to the dashboard
+    botState.patchStatus({
+      chain: this.chain.name,
+      chainId: this.chain.chainId,
+      wallet: this.wallet.address,
+      walletShort: `${this.wallet.address.slice(0, 6)}...${this.wallet.address.slice(-4)}`,
+      balanceNative: balanceNative,
+      nativeToken: this.chain.nativeToken,
+      contractAddress: contractAddress || null,
+      contractShort: contractAddress ? `${contractAddress.slice(0, 6)}...${contractAddress.slice(-4)}` : null,
+      dryRun: this.settings.dryRun,
+      explorer: this.chain.explorer,
+    });
+    botState.setConfig({
+      minProfitUSD: this.settings.minProfitUSD,
+      maxGasUSD: this.settings.maxGasUSD,
+      minDebtUSD: this.settings.minDebtUSD,
+      maxDebtUSD: this.settings.maxDebtUSD,
+      watchThreshold: this.settings.watchThreshold,
+      mevEnabled: this.settings.mevEnabled,
+      slippagePercent: parseFloat(process.env.SLIPPAGE_PERCENT || '1'),
+    });
+
     return true;
   }
 
@@ -206,6 +232,7 @@ class FlashLiquidatorBot {
   async start() {
     if (this.isRunning) return;
     this.isRunning = true;
+    botState.patchStatus({ running: true });
 
     console.log(UI.theme.success(`\n${UI.icons.rocket} Starting Flash Liquidator Bot...`));
     console.log(UI.theme.muted(`   Watching for liquidation opportunities...\n`));
@@ -255,6 +282,9 @@ class FlashLiquidatorBot {
       const liquidatable = this.healthMonitor.getLiquidatablePositions();
       UI.printLiquidatablePositions(liquidatable);
 
+      // Publish a full snapshot to the dashboard
+      this.publishSnapshot(monitorStats, liquidatorStats, atRisk, liquidatable);
+
       // Execute liquidations
       if (liquidatable.length > 0) {
         console.log(UI.theme.error(`\n${UI.icons.fire} ${UI.icons.target} Found ${liquidatable.length} liquidatable position(s)!`));
@@ -285,6 +315,19 @@ class FlashLiquidatorBot {
           // Execute liquidation
           const result = await this.liquidator.liquidate(position, gasSettings);
           UI.printLiquidationResult(result);
+
+          // Publish the attempt to the dashboard
+          botState.pushEvent({
+            success: result.success,
+            simulated: result.simulated,
+            profit: result.profit,
+            gasSpent: result.gasSpent,
+            txHash: result.txHash,
+            reason: result.reason,
+            borrower: position.address,
+            healthFactor: position.healthFactor,
+            debtUSD: position.totalDebtUSD,
+          });
 
           // Track daily stats
           if (result.success) {
@@ -330,6 +373,62 @@ class FlashLiquidatorBot {
   }
 
   /**
+   * Publish a snapshot of live state to the dashboard. Best-effort - any
+   * failure here is swallowed so it can never disrupt the trading loop.
+   */
+  publishSnapshot(monitorStats = {}, liquidatorStats = {}, atRisk = [], liquidatable = []) {
+    try {
+      const mapPos = (p) => ({
+        address: p.address,
+        healthFactor: typeof p.healthFactor === 'number' ? p.healthFactor : parseFloat(p.healthFactor) || 0,
+        totalDebtUSD: p.totalDebtUSD || 0,
+        protocol: p.protocol || 'AAVE_V3',
+      });
+
+      botState.updateSnapshot({
+        connection: {
+          wss: !!monitorStats.hasWebSocket,
+          mempool: !!monitorStats.hasMempool,
+          subgraph: !!monitorStats.usingSubgraph,
+          rpcCallsTotal: monitorStats.rpcStats?.totalCalls || 0,
+          rpcCallsPerMin: monitorStats.rpcStats?.callsPerMinute || 0,
+          multicallBatches: monitorStats.rpcStats?.multicallBatches || 0,
+        },
+        stats: {
+          borrowersTracked: monitorStats.borrowersTracked || 0,
+          atRiskCount: monitorStats.atRiskCount ?? atRisk.length,
+          liquidatableCount: monitorStats.liquidatableCount ?? liquidatable.length,
+          liquidationsAttempted: liquidatorStats.liquidationsAttempted || 0,
+          liquidationsSuccessful: liquidatorStats.liquidationsSuccessful || 0,
+          liquidationsFailed: liquidatorStats.liquidationsFailed || 0,
+          successRate: parseFloat(liquidatorStats.successRate) || 0,
+          totalProfitUSD: liquidatorStats.totalProfitUSD || 0,
+          totalGasSpentUSD: liquidatorStats.totalGasSpentUSD || 0,
+          mempoolOracleUpdates: monitorStats.mempoolStats?.oracleUpdatesDetected || 0,
+          oraclesWatched: monitorStats.mempoolStats?.oracleAddressesWatched || 0,
+        },
+        positions: {
+          atRisk: atRisk.slice(0, 100).map(mapPos),
+          liquidatable: liquidatable.slice(0, 50).map(mapPos),
+        },
+      });
+    } catch (_) {
+      // dashboard is passive - never break the loop
+    }
+
+    // Refresh wallet balance (cheap, ~once per status interval)
+    this.refreshBalance();
+  }
+
+  async refreshBalance() {
+    try {
+      if (!this.provider || !this.wallet) return;
+      const bal = await this.provider.getBalance(this.wallet.address);
+      botState.patchStatus({ balanceNative: parseFloat(ethers.formatEther(bal)) });
+    } catch (_) {}
+  }
+
+  /**
    * Send daily summary
    */
   async sendDailySummary() {
@@ -357,6 +456,7 @@ class FlashLiquidatorBot {
    */
   stop() {
     this.isRunning = false;
+    botState.patchStatus({ running: false });
 
     if (this.mainLoopInterval) {
       clearInterval(this.mainLoopInterval);
@@ -388,6 +488,12 @@ class FlashLiquidatorBot {
 // ============ MAIN ============
 
 async function main() {
+  // Capture logs and bring the dashboard up first, so the UI streams the
+  // entire startup sequence (and stays reachable for Render's health probe
+  // even if bot initialization fails).
+  installLogCapture();
+  startDashboard();
+
   const bot = new FlashLiquidatorBot();
 
   // Graceful shutdown
@@ -410,22 +516,40 @@ async function main() {
     process.exit(0);
   });
 
+  // Transient network/socket errors from RPC or WebSocket endpoints are not
+  // fatal - the bot keeps running on its polling path. Recognizing these by
+  // code AND message avoids a flaky endpoint ever looking like a crash.
+  const isNetworkError = (error) => {
+    const code = error?.code || '';
+    const msg = error?.message || '';
+    const TRANSIENT = [
+      'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN',
+      'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR', 'ECONNABORTED',
+    ];
+    if (TRANSIENT.some((c) => code.includes(c) || msg.includes(c))) return true;
+    return /websocket|socket hang up|network|timeout|connect |disconnected|429|502|503|504|401/i.test(msg);
+  };
+
   // Handle errors
   process.on('unhandledRejection', async (error) => {
-    console.log(UI.theme.error(`\n❌ Unhandled rejection: ${error.message}`));
+    if (isNetworkError(error)) {
+      console.log(UI.theme.warning(`\n⚠️ Network hiccup (non-fatal): ${error?.message || error}`));
+      console.log(UI.theme.muted(`   Continuing - will retry / use polling...`));
+      return;
+    }
+    console.log(UI.theme.error(`\n❌ Unhandled rejection: ${error?.message || error}`));
     await bot.telegram?.notifyError(error);
   });
 
-  // Handle uncaught exceptions (like WebSocket errors)
+  // Handle uncaught exceptions (like WebSocket / RPC connection errors)
   process.on('uncaughtException', async (error) => {
-    // Ignore WebSocket auth/connection errors - they're not fatal
-    if (error.message?.includes('401') || error.message?.includes('WebSocket')) {
-      console.log(UI.theme.warning(`\n⚠️ WebSocket error (non-fatal): ${error.message}`));
-      console.log(UI.theme.muted(`   Continuing in polling mode...`));
+    if (isNetworkError(error)) {
+      console.log(UI.theme.warning(`\n⚠️ Network hiccup (non-fatal): ${error?.message || error}`));
+      console.log(UI.theme.muted(`   Continuing - will retry / use polling...`));
       return;
     }
 
-    console.log(UI.theme.error(`\n❌ Uncaught exception: ${error.message}`));
+    console.log(UI.theme.error(`\n❌ Uncaught exception: ${error?.message || error}`));
     await bot.telegram?.notifyError(error);
     // Don't exit - try to continue
   });

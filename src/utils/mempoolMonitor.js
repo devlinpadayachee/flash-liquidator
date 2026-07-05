@@ -90,6 +90,12 @@ class MempoolMonitor {
     try {
       this.wsProvider = new ethers.WebSocketProvider(wssUrl);
 
+      // CRITICAL: attach a socket-level error handler. Without a listener, an
+      // ETIMEDOUT / connection reset on this socket becomes an uncaught
+      // exception and looks like a crash. Mempool is a best-effort speed
+      // boost - if the socket dies the bot must keep running on polling.
+      this._attachSocketGuards();
+
       // Wait for connection
       await Promise.race([
         this.wsProvider.ready,
@@ -97,6 +103,9 @@ class MempoolMonitor {
           setTimeout(() => reject(new Error('WebSocket timeout')), 10000)
         )
       ]);
+
+      // Re-attach after ready - ethers may (re)create the underlying socket
+      this._attachSocketGuards();
 
       console.log(`   ✅ WebSocket connected for mempool monitoring`);
 
@@ -106,10 +115,32 @@ class MempoolMonitor {
       return true;
 
     } catch (err) {
-      console.log(`   ❌ Mempool monitoring failed: ${err.message}`);
-      console.log(`   📝 Make sure your RPC plan supports pending transactions`);
+      console.log(`   ⚠️ Mempool monitoring unavailable: ${err.message}`);
+      console.log(`   📝 Continuing without mempool (polling still active)`);
+      try { this.wsProvider?.destroy?.(); } catch (_) {}
+      this.wsProvider = null;
       return false;
     }
+  }
+
+  /**
+   * Attach error/close handlers to the underlying WebSocket so a dropped or
+   * timed-out connection is handled here instead of crashing the process.
+   * Safe to call multiple times - handlers are idempotent via a flag.
+   */
+  _attachSocketGuards() {
+    const sock = this.wsProvider?.websocket;
+    if (!sock || sock.__guarded || typeof sock.on !== 'function') return;
+    sock.__guarded = true;
+    sock.on('error', (err) => {
+      console.log(`   ⚠️ Mempool WebSocket error: ${err?.message || err} - disabling mempool, polling continues`);
+      try { this.wsProvider?.destroy?.(); } catch (_) {}
+      this.wsProvider = null;
+    });
+    sock.on('close', () => {
+      console.log(`   ⚠️ Mempool WebSocket closed - polling continues`);
+      this.wsProvider = null;
+    });
   }
 
   /**
