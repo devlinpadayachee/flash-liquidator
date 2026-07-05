@@ -1,0 +1,36 @@
+{
+  "name": "flash-liquidator",
+  "version": "1.0.0",
+  "description": "Zero-capital flash loan liquidation bot for DeFi lending protocols",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "cross-env CHAIN=POLYGON node src/index.js",
+    "dry-run": "cross-env DRY_RUN=true CHAIN=POLYGON node src/index.js",
+    "compile": "npx hardhat compile",
+    "deploy": "node scripts/deployV2Direct.js",
+    "fork-test": "cross-env FORK_POLYGON=true FORK_RPC_URL=https://polygon.gateway.tenderly.co npx hardhat run scripts/forkTestBot.js"
+  },
+  "keywords": [
+    "defi",
+    "liquidation",
+    "flash-loan",
+    "arbitrage"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.4.0",
+    "boxen": "^5.1.2",
+    "chalk": "^4.1.2",
+    "cli-table3": "^0.6.3",
+    "dotenv": "^16.3.1",
+    "ethers": "^6.9.0",
+    "ora": "^5.4.1",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "cross-env": "^7.0.3",
+    "hardhat": "^2.19.0"
+  }
+}
