@@ -48,6 +48,14 @@ class PriorityQueue {
     this.items = [];
   }
 
+  removeByAddress(addr) {
+    const a = addr?.toLowerCase();
+    if (!a) return false;
+    const before = this.items.length;
+    this.items = this.items.filter(i => i.item.address?.toLowerCase() !== a);
+    return before !== this.items.length;
+  }
+
   get length() {
     return this.items.length;
   }
@@ -90,6 +98,12 @@ class HealthMonitor {
 
     // Priority queue for at-risk positions (sorted by HF, lowest first)
     this.priorityQueue = new PriorityQueue();
+
+    // Rotating cursor over the FULL borrower population so every position is
+    // re-priced on a fixed cadence — not just the perennial at-risk set. This
+    // is what lets the bot catch a healthy position that suddenly decays.
+    this.rotationCursor = 0;
+    this.rotationWindow = parseInt(process.env.ROTATION_WINDOW || '200', 10);
 
     // Liquidatable positions (HF < 1.0)
     this.liquidatablePositions = [];
@@ -223,6 +237,38 @@ class HealthMonitor {
 
     // New position is less risky than all current ones - don't add
     return { added: false, replaced: null, updated: false };
+  }
+
+  /**
+   * Evict positions whose health factor has recovered comfortably above the
+   * watch threshold from both the at-risk list and the priority queue.
+   *
+   * Uses hysteresis (watchThreshold * 1.03) so a position sitting right on the
+   * boundary doesn't flap in and out every cycle. Liquidatable positions
+   * (HF < 1) are never touched here. Returns the number evicted.
+   */
+  pruneRecovered() {
+    const recover = this.settings.watchThreshold * 1.03;
+    const freshHF = (addr) => {
+      const b = this.borrowers.get(addr?.toLowerCase());
+      return b && typeof b.healthFactor === 'number' ? b.healthFactor : null;
+    };
+    const isRecovered = (addr) => {
+      const hf = freshHF(addr);
+      return hf !== null && hf >= recover;
+    };
+
+    const beforeAR = this.atRiskPositions.length;
+    this.atRiskPositions = this.atRiskPositions.filter(p => !isRecovered(p.address));
+    const evicted = beforeAR - this.atRiskPositions.length;
+
+    // Also drop recovered entries from the priority queue so the top-N it
+    // hands out isn't clogged with positions that no longer matter.
+    this.priorityQueue.items = this.priorityQueue.items.filter(
+      i => !isRecovered(i.item.address)
+    );
+
+    return evicted;
   }
 
   /**
@@ -986,16 +1032,19 @@ class HealthMonitor {
     const borderlinePositions = [];
     const BORDERLINE_THRESHOLD = 1.30; // Check anything below 1.30
 
+    // Precompute the queued addresses ONCE. The old code ran a linear
+    // priorityQueue.find() inside this per-borrower loop — O(n²) every 5s,
+    // which itself made the loop sluggish as the population grew.
+    const queuedAddrs = new Set(
+      this.priorityQueue.getAll().map(p => p.address?.toLowerCase())
+    );
     for (const [addr, borrower] of this.borrowers) {
       const hf = borrower.healthFactor;
       const age = now - (borrower.lastChecked || 0);
 
       // Include: has HF data, below borderline, not recently checked, NOT already in queue
-      if (hf && hf < BORDERLINE_THRESHOLD && hf >= this.settings.watchThreshold && age > 10000) {
-        const inQueue = this.priorityQueue.getAll().find(p => p.address?.toLowerCase() === addr);
-        if (!inQueue) {
-          borderlinePositions.push(borrower);
-        }
+      if (hf && hf < BORDERLINE_THRESHOLD && hf >= this.settings.watchThreshold && age > 10000 && !queuedAddrs.has(addr)) {
+        borderlinePositions.push(borrower);
       }
     }
 
@@ -1035,6 +1084,26 @@ class HealthMonitor {
         seenAddrs.add(addr);
         toCheck.push(pos);
       }
+    }
+
+    // 4. ROTATION SWEEP — the fix for "always looking at the same items".
+    //    Add a rotating window over the ENTIRE borrower population so every
+    //    position gets re-priced on a fixed cadence, regardless of its last
+    //    known HF. A position that was healthy a minute ago and just crossed
+    //    the line is caught here; the old code would never have looked.
+    let rotationAdded = 0;
+    const allAddrs = [...this.borrowers.keys()];
+    if (allAddrs.length > 0) {
+      const win = Math.min(this.rotationWindow, allAddrs.length);
+      for (let i = 0; i < win; i++) {
+        const addr = allAddrs[(this.rotationCursor + i) % allAddrs.length];
+        if (!seenAddrs.has(addr)) {
+          seenAddrs.add(addr);
+          toCheck.push(this.borrowers.get(addr));
+          rotationAdded++;
+        }
+      }
+      this.rotationCursor = (this.rotationCursor + win) % allAddrs.length;
     }
 
     if (toCheck.length === 0) return;
@@ -1113,6 +1182,12 @@ class HealthMonitor {
       }
     }
 
+    // Evict positions that have recovered comfortably above the watch
+    // threshold. Without this, a position that dips to HF 1.05 then recovers
+    // stays in the at-risk list forever and permanently burns bandwidth —
+    // the root cause of the bot fixating on the same items.
+    const evicted = this.pruneRecovered();
+
     // Sort liquidatable by HF
     this.liquidatablePositions.sort((a, b) => a.healthFactor - b.healthFactor);
     this.atRiskPositions.sort((a, b) => a.healthFactor - b.healthFactor);
@@ -1126,8 +1201,8 @@ class HealthMonitor {
       console.log(`   ⚠️ Found ${newAtRisk} newly at-risk position(s)!`);
     }
 
-    // ALWAYS log priority check summary (confirms at-risk ARE being rechecked!)
-    console.log(`   ✅ Priority check: ${toCheck.length} positions rechecked (${this.atRiskPositions.length} at-risk, ${this.liquidatablePositions.length} liquidatable)`);
+    // ALWAYS log priority check summary (confirms rotation + eviction are working)
+    console.log(`   ✅ Priority check: ${toCheck.length} rechecked (rotation +${rotationAdded}, evicted ${evicted}) → ${this.atRiskPositions.length} at-risk, ${this.liquidatablePositions.length} liquidatable`);
   }
 
   /**

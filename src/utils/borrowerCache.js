@@ -19,6 +19,10 @@ class BorrowerCache {
     // In-memory data
     this.borrowers = new Map();
     this.closedPositions = new Set(); // Addresses that have been liquidated/closed
+    this.closedAt = new Map();        // address -> epoch ms when closed (for TTL expiry)
+    // After this cooldown, a closed address may be rediscovered again. Without
+    // it, an address that gets liquidated then re-borrows is ignored forever.
+    this.closedTTL = parseInt(process.env.CLOSED_TTL_HOURS || '12', 10) * 3600 * 1000;
     this.liquidatablePositions = new Map(); // Positions that were liquidatable (need recheck on restart)
     this.lastScanBlock = 0;
     this.lastSaveTime = 0;
@@ -65,13 +69,22 @@ class BorrowerCache {
       // Load closed positions
       if (fs.existsSync(this.closedFile)) {
         const closedData = JSON.parse(fs.readFileSync(this.closedFile, 'utf8'));
+        const nowTs = Date.now();
+        let expiredOnLoad = 0;
         if (closedData.closed && Array.isArray(closedData.closed)) {
-          for (const addr of closedData.closed) {
-            this.closedPositions.add(addr.toLowerCase());
+          for (const entry of closedData.closed) {
+            // Support legacy string entries and new { a, t } entries
+            const addr = (typeof entry === 'string' ? entry : entry?.a)?.toLowerCase();
+            if (!addr) continue;
+            const ts = (typeof entry === 'object' && entry.t) ? entry.t : nowTs;
+            // Drop already-expired closes on load so they can be rediscovered
+            if (this.closedTTL > 0 && nowTs - ts > this.closedTTL) { expiredOnLoad++; continue; }
+            this.closedPositions.add(addr);
+            this.closedAt.set(addr, ts);
           }
         }
         this.stats.closedTracked = this.closedPositions.size;
-        console.log(`      Closed positions: ${this.closedPositions.size}`);
+        console.log(`      Closed positions: ${this.closedPositions.size}${expiredOnLoad ? ` (${expiredOnLoad} expired, re-open for discovery)` : ''}`);
       }
 
       // Load liquidatable positions (need recheck on restart!)
@@ -136,7 +149,7 @@ class BorrowerCache {
         chain: this.chainName,
         savedAt: new Date().toISOString(),
         count: this.closedPositions.size,
-        closed: Array.from(this.closedPositions),
+        closed: Array.from(this.closedPositions).map(a => ({ a, t: this.closedAt.get(a) || Date.now() })),
       };
       fs.writeFileSync(this.closedFile, JSON.stringify(closedData, null, 2));
 
@@ -181,8 +194,8 @@ class BorrowerCache {
   set(address, data) {
     const addr = address.toLowerCase();
 
-    // Don't add if in closed list
-    if (this.closedPositions.has(addr)) {
+    // Don't add if in closed list (respects the TTL cooldown in isClosed)
+    if (this.isClosed(addr)) {
       return false;
     }
 
@@ -215,16 +228,30 @@ class BorrowerCache {
   markClosed(address) {
     const addr = address.toLowerCase();
     this.closedPositions.add(addr);
+    this.closedAt.set(addr, Date.now());
     this.borrowers.delete(addr);
     this.stats.closedTracked = this.closedPositions.size;
   }
 
   /**
-   * Check if position is marked as closed
+   * Check if position is marked as closed. After closedTTL has elapsed the
+   * entry expires and this returns false, so a re-borrowing address can be
+   * rediscovered instead of being blacklisted forever.
    */
   isClosed(address) {
     if (!address) return false;
-    return this.closedPositions.has(address.toLowerCase());
+    const addr = address.toLowerCase();
+    if (!this.closedPositions.has(addr)) return false;
+    if (this.closedTTL > 0) {
+      const ts = this.closedAt.get(addr) || 0;
+      if (Date.now() - ts > this.closedTTL) {
+        this.closedPositions.delete(addr);
+        this.closedAt.delete(addr);
+        this.stats.closedTracked = this.closedPositions.size;
+        return false;
+      }
+    }
+    return true;
   }
 
   /**
@@ -235,6 +262,7 @@ class BorrowerCache {
     const addr = address.toLowerCase();
     if (this.closedPositions.has(addr)) {
       this.closedPositions.delete(addr);
+      this.closedAt.delete(addr);
       this.stats.closedTracked = this.closedPositions.size;
       return true;
     }
